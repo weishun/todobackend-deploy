@@ -1,0 +1,286 @@
+---
+AWSTemplateFormation: 2010-09-09
+Description: Todobackend Stack
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The target VPC Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: The target subnet Id in AZ A
+  KeyName:
+    Type: String
+    Description: The keypair that is allowed SSH access
+  InstanceCount:
+    Type: Number
+    Description: The desired number of application instances
+  DbSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The target DB Subnet Group subnet Ids
+  DbAvailabilityZone:
+    Type: String
+    Description: The target availability zone for the db instance
+  DbUsername:
+    Type: String
+    Description: The RDS db username
+  DbPassword:
+    Type: String
+    Description: The RDS db password
+    NoEcho: "true"
+    
+Resources:
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: 
+        - ${SubnetId}
+      LaunchConfigurationName: 
+        - ${AutoScalingLaunchConfiguration}
+      MinSize: 0
+      MaxSize: 2
+      DesiredCapacity: ${InstanceCount}
+      Tags:
+        - Key: Name
+          Value: ${AWS::StackName}-instance
+          PropagateAtLaunch: "true"
+  AutoScalingLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: ami-9d1f7efe
+      InstanceType: t2.micro
+      KeyName: ${KeyPair}
+      IamInstanceProfile: ${EC2InstanceProfile}
+      SecurityGroups:
+        - ${EC2InstanceSecurityGroup}
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+          groupadd -g 1000 jenkins
+          useradd -u 1000 -g jenkins jenkins
+          mkdir -p /ecs/jenkins_home
+          chown -R jenkins:jenkins /ecs/jenkins_home
+  EC2InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: todobackend-sg
+      VpcId: ${VpcId}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "8000"
+          ToPort: "8000"
+          SourceSecurityGroupId: ${ElbSecurityGroup}
+        - IpProtocol: tcp
+          FromPort: "22"
+          ToPort: "22"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ${AWS::StackName}-instance-sg
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - ${EC2InstanceRole}
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service:
+                - ec2.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBSubnetGroupName: ${DbSubnetGroup}
+      MultiAZ: "false"
+      AvailalbilityZone: ${DbAvailabilityZone}
+      AllocatedStorage: 8
+      StorageType: gp2
+      DBInstanceClass: db.t2.micro
+      DBName: todobackend
+      Engine: MySQL
+      EngineVersion: "5.6"
+      MasterUsername: ${DbUsername}
+      MasterUserPassword: ${DbPassword}
+      VPCSecurityGroups:
+        - ${DbSecurityGroup}
+      Tags:
+        - Key: Name
+          Value: ${AWS::Stackname}-db
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Todobackend DB Security Group
+      VpcId: ${VpcId}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "3306"
+          ToPort: "3306"
+          SourceSecurityGroupId: ${EC2InstanceSecurityGroup}
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Totobackend DB Subnet Group
+      SubnetIds: ${DbSubnets}
+      Tags:
+        - Key: Name
+          Value: ${AWS::Stackname}-db-subnet-group
+  ElasticLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      CrossZone: "false"
+      SecurityGroups: ${ElbSecurityGroup}
+      Listeners:
+        - LoadBalancerPort: "80"
+          InstancePort: "8080"
+          Protocol: http
+      HealthCheck:
+        Target: HTTP:8000/todos
+        HealthyThreshold: 2
+        UnhealthyThreshold: 10
+        Interval: 30
+        Timeout: 5
+      Subnets:
+        - ${SubnetId}
+      Tags:
+        - Key: Name
+          Value: ${AWS::Stackname}-elb
+  ElbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Todobackend ELB security group
+      VpcId: ${VpcId}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ${AWS::StackName}-elb-sg
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+  TodobackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContinerDefinitions:
+        - Name: todobackend
+          Image: weishun/todobackend
+          Memory: 450
+          Environment:
+            - Name: DJANGO_SETTINGS_MODULE
+              Value: todobackend.settings.release
+            - Name: MYSQL_HOST
+              Value: 
+                Fn::GetAtt:
+                - DbInstance
+                - Endpoint.Address
+            - Name: MYSQL_USER
+              Value: ${DbUsername}
+            - Name: MYSQL_PASSWORD
+              Value: ${DbPassword}
+          MountPoints:
+            - SourceVolume: webroot
+              ContainerPath: /var/www/todobackend
+          Command:
+            - uwsgi
+            - "--socket /var/www/todobackend/todobackend.sock"
+            - "--chmod-socket=666"
+            - "--module todobackend.wsgi"
+            - "--master"
+            - "--die-on-term"
+        - Name: nginx
+          Image: weishun/todobackend-nginx
+          Memory: 300
+          PortMappings:
+            - ContainerPort: "8000"
+              HostPort: "8000"
+          MountPoints:
+            - ContainerPath: /var/www/todobackend
+              SourceVolume: webroot
+      Volumes:
+        - Name: webroot
+          Host: 
+            SourcePath: /ecs/webroot
+  TodobackendAdhocTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContinerDefinitions:
+        - Name: todobackend
+          Image: weishun/todobackend
+          Memory: 245
+          Environment:
+            - Name: DJANGO_SETTINGS_MODULE
+              Value: todobackend.settings.release
+            - Name: MYSQL_HOST
+              Value: 
+                Fn::GetAtt:
+                - DbInstance
+                - Endpoint.Address
+            - Name: MYSQL_USER
+              Value: ${DbUsername}
+            - Name: MYSQL_PASSWORD
+              Value: ${DbPassword}
+          MountPoints:
+            - ContainerPath: /var/www/todobackend
+              SourceVolume: webroot
+      Volumes:
+        - Name: webroot
+          Host: 
+            SourcePath: /ecs/webroot
+  TodobackendService:
+    Type: AWS::ECS::Serivce
+    Properties:
+      TaskDefinition: ${TodobackendTaskDefinition}
+      Cluster: ${EcsCluster}
+      LoadBalancers:
+        - ContainerName: nginx
+          ContainerPort: "8000"
+          LoadBalancerName: ${ElasticLoadBalanceer}
+      Role: ${EcsServcieRole}
+      DesiredCount: 0
+  EcsServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole
+
+Outputs:
+  ElbDomainName:
+    Description: Public DNS name of ELB
+    Value: 
+      Fn::GetAtt:
+      - ElasticLoadBalancer
+      - DNSName
+  EcsCluster:
+    Description: Amazon Resource Name (ARN) of Todobackend Ecs Cluster
+    Value: ${EcsCluster}
+  TodobackendTaskDefinition:
+    Description: Amazon Resource Name (ARN) of Todobackend Task Definition
+    Value: ${TodobackendTaskDefinition}
+  TodobackendAdhocTaskDefinition:
+    Description: Amazon Resource Name (ARN) of Todobackend Adhoc Task Definition
+    Value: ${TodobackendAdhocTaskDefinition}
+  TodobackendService:
+    Description: Amazon Resource Name (ARN) of Todobackend Service
+    Value: ${TodobackendService}
